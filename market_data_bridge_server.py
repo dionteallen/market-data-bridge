@@ -88,7 +88,61 @@ def get_ticker(product_id: str) -> dict:
         return {"status": "error", "http_status": resp.status_code, "detail": resp.text}
     return {"status": "ok", "product_id": product_id, **resp.json()}
 
+# Published Coinbase Advanced Trade fee schedule (public, static — not
+# account-verified). Source: Coinbase's own published tier table, as
+# compiled from public documentation current as of September 2026.
+# This is a best-effort public schedule, not a live authenticated feed —
+# Coinbase's actual account-tier endpoint requires authentication and
+# is out of scope until a real trading connection exists (Phase 2).
+_FEE_TIERS = [
+    # (min_30d_volume_usd, maker_rate, taker_rate)
+    (0, 0.0060, 0.0120),
+    (10_000, 0.0025, 0.0040),
+    (50_000, 0.0015, 0.0025),
+]
 
+
+@mcp.tool()
+def get_fee_tier(assumed_30d_volume_usd: float = 0) -> dict:
+    """
+    Coinbase Advanced Trade's PUBLIC, STATIC fee schedule — not read from
+    your actual account, since that requires authentication this bridge
+    does not have yet (Phase 2, once a real trading connection exists).
+
+    assumed_30d_volume_usd: the 30-day trading volume to look up a tier
+    for. Defaults to 0 (the lowest tier), which is realistic for a very
+    small account.
+
+    This is intentionally conservative and clearly labeled — never treat
+    this as your confirmed real account rate. Above $50,000 in volume,
+    this tool does not have a verified tier and says so explicitly
+    rather than guessing.
+    """
+    tier = None
+    for min_vol, maker, taker in _FEE_TIERS:
+        if assumed_30d_volume_usd >= min_vol:
+            tier = (min_vol, maker, taker)
+    if tier is None:
+        return {"status": "error", "detail": "no tier found"}
+
+    min_vol, maker, taker = tier
+    above_verified_range = assumed_30d_volume_usd >= 50_000
+    return {
+        "status": "ok",
+        "source": "public_static_schedule",
+        "verified_against_account": False,
+        "tier_min_30d_volume_usd": min_vol,
+        "maker_rate": maker,
+        "taker_rate": taker,
+        "round_trip_worst_case_rate": round(taker * 2, 6),
+        "warning": (
+            "Above $50,000 in 30-day volume this schedule is not "
+            "independently verified — confirm directly with Coinbase "
+            "before relying on it."
+            if above_verified_range
+            else None
+        ),
+    }
 @asynccontextmanager
 async def lifespan(app):
     async with mcp.session_manager.run():
