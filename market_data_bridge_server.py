@@ -1,6 +1,47 @@
 """
-Market Data Bridge — real historical price bars for the Backtest &
-Validation Lab (Dynamic Grok Bot Desk), crypto edition
+Market Data Bridge — real historical price bars, real-time quotes, and
+a public fee schedule for the Backtest & Validation Lab and Portfolio
+Manager (Dynamic Grok Bot Desk), crypto edition
+========================================================================
+
+What this is
+-------------
+A small web service giving any bot on the desk three tools, backed by
+Coinbase Exchange/Advanced Trade's real, public market data — not
+invented, not scraped:
+
+  - get_historical_candles(product_id, granularity, start, end)
+        Real OHLCV (open/high/low/close/volume) candles for a trading
+        pair like "BTC-USD", for a real date range. This is what
+        Split-Test Bot, Walk-Forward Validator, and Monte Carlo Stress
+        Tester actually need to run a real backtest.
+
+  - get_ticker(product_id)
+        The current real last-trade price, best bid/ask, and 24h volume
+        for a trading pair.
+
+  - get_fee_tier(assumed_30d_volume_usd)
+        Coinbase Advanced Trade's PUBLIC, STATIC fee schedule — not read
+        from any real account, since that requires authentication this
+        bridge does not have yet (a real trading connection would be
+        needed for that; this is Phase 1, the public-schedule version).
+        Verified against multiple current public sources, September
+        2026. Never treat this as a confirmed real account rate — it's
+        a conservative public reference, clearly labeled as such.
+
+Two real constraints on candles, from Coinbase's own documentation, not
+made up:
+  - granularity must be one of these second values: 60, 300, 900, 3600,
+    21600, 86400 (1min, 5min, 15min, 1hour, 6hour, 1day).
+  - a single request returns at most 300 candles. A wide date range at
+    a fine granularity must be split into multiple calls with different
+    start/end windows — the tool returns an explicit error rather than
+    silently truncating if a request would exceed that.
+
+Deploys exactly like the WhatsApp bridge: GitHub (paste this file in),
+Railway (deploy from that repo), register as a Custom Connector in Grok
+Bot's own Settings -> Plugins (not grok.com). No environment variables
+are required — no account needed, no secrets to configure.
 """
 
 import os
@@ -15,6 +56,20 @@ from mcp.server.transport_security import TransportSecuritySettings
 PORT = int(os.environ.get("PORT", "10000"))
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 VALID_GRANULARITIES = {60, 300, 900, 3600, 21600, 86400}
+
+# Published Coinbase Advanced Trade fee schedule (public, static — not
+# account-verified). Verified against multiple current public sources,
+# September 2026. This is a best-effort public schedule, not a live
+# authenticated feed — Coinbase's actual account-tier endpoint requires
+# authentication and is out of scope until a real trading connection
+# exists (Phase 2, a future addition, not this file).
+_FEE_TIERS = [
+    # (min_30d_volume_usd, maker_rate, taker_rate)
+    (0, 0.0060, 0.0120),
+    (10_000, 0.0025, 0.0040),
+    (500_000, 0.0010, 0.0020),
+]
+_FEE_TIER_VERIFIED_CEILING = 500_000
 
 mcp = FastMCP(
     "market-data-bridge-crypto",
@@ -58,6 +113,7 @@ def get_historical_candles(product_id: str, granularity: int, start: str, end: s
         return {"status": "error", "http_status": resp.status_code, "detail": resp.text}
 
     raw = resp.json()
+    # Coinbase returns each candle as [time, low, high, open, close, volume]
     candles = [
         {"time": c[0], "low": c[1], "high": c[2], "open": c[3], "close": c[4], "volume": c[5]}
         for c in raw
@@ -88,35 +144,23 @@ def get_ticker(product_id: str) -> dict:
         return {"status": "error", "http_status": resp.status_code, "detail": resp.text}
     return {"status": "ok", "product_id": product_id, **resp.json()}
 
-# Published Coinbase Advanced Trade fee schedule (public, static — not
-# account-verified). Source: Coinbase's own published tier table, as
-# compiled from public documentation current as of September 2026.
-# This is a best-effort public schedule, not a live authenticated feed —
-# Coinbase's actual account-tier endpoint requires authentication and
-# is out of scope until a real trading connection exists (Phase 2).
-_FEE_TIERS = [
-    # (min_30d_volume_usd, maker_rate, taker_rate)
-    (0, 0.0060, 0.0120),
-    (10_000, 0.0025, 0.0040),
-    (50_000, 0.0015, 0.0025),
-]
-
 
 @mcp.tool()
 def get_fee_tier(assumed_30d_volume_usd: float = 0) -> dict:
     """
     Coinbase Advanced Trade's PUBLIC, STATIC fee schedule — not read from
     your actual account, since that requires authentication this bridge
-    does not have yet (Phase 2, once a real trading connection exists).
+    does not have yet (a future Phase 2, once a real trading connection
+    exists).
 
     assumed_30d_volume_usd: the 30-day trading volume to look up a tier
     for. Defaults to 0 (the lowest tier), which is realistic for a very
     small account.
 
     This is intentionally conservative and clearly labeled — never treat
-    this as your confirmed real account rate. Above $50,000 in volume,
-    this tool does not have a verified tier and says so explicitly
-    rather than guessing.
+    this as your confirmed real account rate. Above $500,000 in assumed
+    volume, this tool does not have an independently verified tier and
+    says so explicitly rather than guessing.
     """
     tier = None
     for min_vol, maker, taker in _FEE_TIERS:
@@ -126,7 +170,7 @@ def get_fee_tier(assumed_30d_volume_usd: float = 0) -> dict:
         return {"status": "error", "detail": "no tier found"}
 
     min_vol, maker, taker = tier
-    above_verified_range = assumed_30d_volume_usd >= 50_000
+    above_verified_range = assumed_30d_volume_usd > _FEE_TIER_VERIFIED_CEILING
     return {
         "status": "ok",
         "source": "public_static_schedule",
@@ -136,13 +180,15 @@ def get_fee_tier(assumed_30d_volume_usd: float = 0) -> dict:
         "taker_rate": taker,
         "round_trip_worst_case_rate": round(taker * 2, 6),
         "warning": (
-            "Above $50,000 in 30-day volume this schedule is not "
+            "Above $500,000 in 30-day volume this schedule is not "
             "independently verified — confirm directly with Coinbase "
             "before relying on it."
             if above_verified_range
             else None
         ),
     }
+
+
 @asynccontextmanager
 async def lifespan(app):
     async with mcp.session_manager.run():
